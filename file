@@ -1,0 +1,185 @@
+"""
+Spatial-Interpolation-of-Rainfall-using-Kriging-vs-ML
+Synthetic-data example comparing Ordinary Kriging (PyKrige) with ML regressors
+(e.g., Random Forest and Gradient Boosting) for rainfall interpolation.
+
+Requirements:
+- numpy, pandas, matplotlib, scikit-learn, pykrige
+  pip install numpy pandas matplotlib scikit-learn pykrige
+
+Run in a local environment or Colab. This script:
+- Generates >100 synthetic rainfall station observations over a bbox
+- Builds an underlying continuous rainfall field (the "truth")
+- Fits Ordinary Kriging and ML regressors using station data
+- Evaluates with hold-out test set and cross-validation
+- Plots predicted maps and prints RMSEs
+
+Author: Amos Meremu Dogiye
+GitHub: https://github.com/GTVSOFT
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.metrics import mean_squared_error
+from pykrige.ok import OrdinaryKriging
+
+# ------------------- User settings -------------------
+NUM_POINTS = 300            # >100 points as requested
+RANDOM_SEED = 42
+GRID_RES = 100              # grid resolution (number of cells per axis for plotting)
+TEST_SIZE = 0.2
+N_JOBS = -1                 # for sklearn where applicable
+
+np.random.seed(RANDOM_SEED)
+
+# ------------------- Define domain and true field -------------------
+# Bounding box (x_min, x_max, y_min, y_max)
+bbox = (0.0, 100.0, 0.0, 100.0)
+xmin, xmax, ymin, ymax = bbox
+
+# Create a smooth underlying rainfall field (the "truth") using a combination of Gaussians
+def true_rain_field(x, y):
+    # three gaussian bumps + gentle gradient
+    z = (
+        30 * np.exp(-((x-30)**2 + (y-40)**2) / (2*12**2)) +
+        45 * np.exp(-((x-70)**2 + (y-70)**2) / (2*8**2)) +
+        20 * np.exp(-((x-50)**2 + (y-20)**2) / (2*15**2)) +
+        0.1 * x  # weak eastward gradient
+    )
+    return z
+
+# Create high-resolution grid for the "true" field (for visualization & validation)
+grid_x = np.linspace(xmin, xmax, GRID_RES)
+grid_y = np.linspace(ymin, ymax, GRID_RES)
+gx, gy = np.meshgrid(grid_x, grid_y)
+truth_grid = true_rain_field(gx, gy)
+
+# ------------------- Generate synthetic station observations -------------------
+# Random station locations
+xs = np.random.uniform(xmin, xmax, NUM_POINTS)
+ys = np.random.uniform(ymin, ymax, NUM_POINTS)
+
+# True rainfall at station locations
+zs_true = true_rain_field(xs, ys)
+
+# Add measurement noise to simulate observed rainfall (station measurements)
+noise_sigma = 3.0
+zs_obs = zs_true + np.random.normal(0, noise_sigma, size=zs_true.shape)
+
+# Create DataFrame
+stations = pd.DataFrame({'x': xs, 'y': ys, 'z_obs': zs_obs, 'z_true': zs_true})
+
+# ------------------- Train/test split -------------------
+train_df, test_df = train_test_split(stations, test_size=TEST_SIZE, random_state=RANDOM_SEED)
+
+# Features and targets
+X_train = train_df[['x','y']].values
+y_train = train_df['z_obs'].values
+X_test = test_df[['x','y']].values
+y_test = test_df['z_true'].values  # compare to truth (noise-free) or y_test_obs if comparing to observed
+
+# ------------------- Ordinary Kriging -------------------
+# PyKrige expects 1D arrays of coordinates and values
+OK = OrdinaryKriging(
+    train_df['x'].values,
+    train_df['y'].values,
+    train_df['z_obs'].values,
+    variogram_model='spherical',  # common choice; can try 'exponential', 'gaussian'
+    verbose=False,
+    enable_plotting=False,
+)
+
+# Predict on test points
+z_ok_test, ss = OK.execute('points', X_test[:,0], X_test[:,1])
+z_ok_test = np.array(z_ok_test).ravel()
+
+# Predict on grid for visualization
+z_ok_grid, ss_grid = OK.execute('grid', grid_x, grid_y)
+z_ok_grid = np.array(z_ok_grid)
+
+# ------------------- Machine Learning regressors -------------------
+rf = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED, n_jobs=N_JOBS)
+gb = GradientBoostingRegressor(n_estimators=200, learning_rate=0.1, random_state=RANDOM_SEED)
+
+# Fit on training stations (observed values)
+rf.fit(X_train, y_train)
+gb.fit(X_train, y_train)
+
+# Predict on test locations (compare to truth grid values at those points)
+z_rf_test = rf.predict(X_test)
+z_gb_test = gb.predict(X_test)
+
+# Predict on grid
+grid_points = np.column_stack([gx.ravel(), gy.ravel()])
+z_rf_grid = rf.predict(grid_points).reshape(gx.shape)
+z_gb_grid = gb.predict(grid_points).reshape(gx.shape)
+
+# ------------------- Evaluation -------------------
+# Compute RMSE against the true (noise-free) rainfall at test points
+rmse_ok = np.sqrt(mean_squared_error(y_test, z_ok_test))
+rmse_rf = np.sqrt(mean_squared_error(y_test, z_rf_test))
+rmse_gb = np.sqrt(mean_squared_error(y_test, z_gb_test))
+
+print('Number of stations:', NUM_POINTS)
+print('Training stations:', len(train_df), 'Test stations:', len(test_df))
+print('RMSE (Ordinary Kriging)    : {:.3f} mm'.format(rmse_ok))
+print('RMSE (Random Forest)       : {:.3f} mm'.format(rmse_rf))
+print('RMSE (Gradient Boosting)   : {:.3f} mm'.format(rmse_gb))
+
+# Cross-validated score (for ML models) - using observed values during CV
+kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+rf_cv_scores = -cross_val_score(rf, stations[['x','y']].values, stations['z_obs'].values,
+                               cv=kf, scoring='neg_mean_squared_error', n_jobs=N_JOBS)
+gb_cv_scores = -cross_val_score(gb, stations[['x','y']].values, stations['z_obs'].values,
+                                cv=kf, scoring='neg_mean_squared_error', n_jobs=N_JOBS)
+print('\nCross-validated MSE (RF):', np.mean(rf_cv_scores).round(3), '-> RMSE:', np.sqrt(np.mean(rf_cv_scores)).round(3))
+print('Cross-validated MSE (GB):', np.mean(gb_cv_scores).round(3), '-> RMSE:', np.sqrt(np.mean(gb_cv_scores)).round(3))
+
+# ------------------- Visualization -------------------
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+# True field
+ax = axes[0,0]\cax = ax.imshow(truth_grid, origin='lower', extent=bbox, aspect='auto')
+ax.scatter(stations['x'], stations['y'], c=stations['z_obs'], edgecolor='k', s=30)
+ax.set_title('True rainfall field + station observations')
+fig.colorbar(cax, ax=ax, label='rainfall (mm)')
+
+# Kriging result
+ax = axes[0,1]
+cax = ax.imshow(z_ok_grid, origin='lower', extent=bbox, aspect='auto')
+ax.scatter(train_df['x'], train_df['y'], c='white', edgecolor='k', s=20, label='train')
+ax.scatter(test_df['x'], test_df['y'], c='black', s=20, label='test')
+ax.set_title('Ordinary Kriging prediction')
+ax.legend()
+fig.colorbar(cax, ax=ax, label='rainfall (mm)')
+
+# Random Forest result
+ax = axes[1,0]
+cax = ax.imshow(z_rf_grid, origin='lower', extent=bbox, aspect='auto')
+ax.scatter(train_df['x'], train_df['y'], c='white', edgecolor='k', s=20)
+ax.scatter(test_df['x'], test_df['y'], c='black', s=20)
+ax.set_title('Random Forest prediction')
+fig.colorbar(cax, ax=ax, label='rainfall (mm)')
+
+# Gradient Boosting result
+ax = axes[1,1]
+cax = ax.imshow(z_gb_grid, origin='lower', extent=bbox, aspect='auto')
+ax.scatter(train_df['x'], train_df['y'], c='white', edgecolor='k', s=20)
+ax.scatter(test_df['x'], test_df['y'], c='black', s=20)
+ax.set_title('Gradient Boosting prediction')
+fig.colorbar(cax, ax=ax, label='rainfall (mm)')
+
+plt.tight_layout()
+plt.show()
+
+# ------------------- Save outputs (optional) -------------------
+# Uncomment to save grid predictions to .npy files for later use
+# np.save('truth_grid.npy', truth_grid)
+# np.save('kriging_grid.npy', z_ok_grid)
+# np.save('rf_grid.npy', z_rf_grid)
+# np.save('gb_grid.npy', z_gb_grid)
+
+# End of script
